@@ -1,13 +1,9 @@
-// /src/runtime/assert.js
-
-// UPDATED: Import both engines
 import { rulesEngine, transformsEngine } from './rules.js'
 import { ValidationError } from './errors.js'
 
 /**
  * Validates and sanitizes data against a schema object at runtime.
- * Throws a detailed error upon validation failure.
- * Returns a sanitized data object upon success.
+ * Now supports inline nested object validation via a 'properties' keyword.
  * @param {object} data - The data object to validate.
  * @param {object} schema - The schema object for the current level of data.
  * @param {object} [allSchemas={}] - An object containing all available schemas for nesting.
@@ -15,10 +11,13 @@ import { ValidationError } from './errors.js'
  */
 export function assert(data, schema, allSchemas = {}) {
   if (typeof data !== 'object' || data === null) {
-    throw new Error('Assertion failed: provided data must be a non-null object.')
+    throw new ValidationError({
+      property: null,
+      rule: 'type',
+      message: 'Input data must be a non-null object.',
+    })
   }
 
-  // NEW: Create a shallow copy to hold sanitized data. We will modify this copy.
   const sanitizedData = { ...data }
 
   for (const schemaKey in schema) {
@@ -27,14 +26,14 @@ export function assert(data, schema, allSchemas = {}) {
     const rules = schema[schemaKey]
 
     if (!sanitizedData.hasOwnProperty(propertyName)) {
-      if (isOptional) {
-        continue
-      } else {
-        throw new Error(`Assertion failed: required property '${propertyName}' is missing.`)
-      }
+      if (isOptional) continue
+      throw new ValidationError({
+        property: propertyName,
+        rule: 'required',
+        message: `Required property '${propertyName}' is missing.`,
+      })
     }
 
-    // --- NEW: Block to apply transformations before validation ---
     if (rules.transform && Array.isArray(rules.transform)) {
       let currentValue = sanitizedData[propertyName]
       for (const transformName of rules.transform) {
@@ -45,35 +44,44 @@ export function assert(data, schema, allSchemas = {}) {
       }
       sanitizedData[propertyName] = currentValue
     }
-    // -----------------------------------------------------------
 
-    // UPDATED: Get the value from the sanitized copy for validation.
     const value = sanitizedData[propertyName]
 
-    // (The rest of the nesting/validation logic remains the same)
     if (allSchemas && allSchemas[rules.type]) {
       try {
-        // Pass the sanitized nested object for validation.
-        const sanitizedNested = assert(value, allSchemas[rules.type], allSchemas)
-        // Place the returned sanitized nested object back into our copy.
-        sanitizedData[propertyName] = sanitizedNested
+        sanitizedData[propertyName] = assert(value, allSchemas[rules.type], allSchemas)
       } catch (error) {
-        // UPDATED: Handle nested ValidationErrors gracefully
         if (error instanceof ValidationError) {
           throw new ValidationError({
-            property: `${propertyName}.${error.property}`, // Prepend path
+            property: `${propertyName}.${error.property}`,
             message: error.message,
             value: error.value,
             rule: error.rule,
           })
         } else {
-          // Fallback for other unexpected errors
           throw new Error(`Validation failed for '${propertyName}': ${error.message}`)
         }
       }
     } else {
+      // --- NEW LOGIC: Handle inline nested object validation ---
+      if (rules.properties) {
+        // The property must be an object to check its properties.
+        if (typeof value !== 'object' || value === null) {
+          throw new ValidationError({
+            property: propertyName,
+            rule: 'type',
+            message: `Property '${propertyName}' must be an object to validate its properties.`,
+            value: value,
+          })
+        }
+        // Recurse into the nested properties.
+        sanitizedData[propertyName] = assert(value, rules.properties, allSchemas)
+      }
+      // --------------------------------------------------------
+
       for (const ruleName in rules) {
-        if (ruleName === 'transform') continue // Don't treat 'transform' as a validation rule
+        // We've already handled 'transform' and the new 'properties' rule.
+        if (ruleName === 'transform' || ruleName === 'properties') continue
 
         const ruleArgument = rules[ruleName]
         const validator = rulesEngine[ruleName]
@@ -83,7 +91,8 @@ export function assert(data, schema, allSchemas = {}) {
             property: propertyName,
             rule: 'unknown',
             message: `Unknown validation rule: '${ruleName}'.`,
-          })        }
+          })
+        }
         if (!validator(value, ruleArgument)) {
           throw new ValidationError({
             property: propertyName,
@@ -95,7 +104,5 @@ export function assert(data, schema, allSchemas = {}) {
       }
     }
   }
-
-  // UPDATED: Return the sanitized data object on success.
   return sanitizedData
 }
