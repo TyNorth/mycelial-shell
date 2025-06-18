@@ -1,0 +1,12 @@
+{
+  "hostName": "MycelialShell-A",
+  "description": "The primary host for user management and registration.",
+  "spores": [
+    {
+      "name": "spore-user-registration",
+      "globalVar": "SporeUserRegistration",
+      "url": "http://localhost:5174/spore.js",
+      "description": "A form for creating new users."
+    }
+  ]
+}

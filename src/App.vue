@@ -1,206 +1,193 @@
 <script setup>
-import { reactive, onMounted, ref, watch } from 'vue'
+import { reactive, onMounted, ref, computed, onUnmounted } from 'vue'
 import * as Y from 'yjs'
 import { WebrtcProvider } from 'y-webrtc'
-// Import everything from our integrated MycoAssert library
 import { assert, ValidationError, verifyContract } from './mycoassert'
+import { trails as localTrails } from './naver.js'
 
-// --- Y.js Integration ---
+// --- Shared State & CTX Setup (Unchanged) ---
 const ydoc = new Y.Doc()
 const provider = new WebrtcProvider('mycelial-shell-room', ydoc)
 const sharedUsers = ydoc.getArray('users')
-
-// A reactive list to hold our dynamically discovered spores.
-const discoveredSpores = ref([])
-
-// Initialize the shared state if it's empty
 if (sharedUsers.length === 0) {
   sharedUsers.push([{ id: 1, name: 'Host User' }])
 }
 
 const handleDispatch = (action) => {
-  console.log('SHELL: Received dispatch for action type:', action.type)
-
+  console.log(`SHELL-A: Received dispatch for action: ${action.type}`)
   switch (action.type) {
     case 'USER_REGISTERED':
-      // We know this action's payload is a new user object.
-      // We add it to our shared Y.js array.
       sharedUsers.push([action.payload])
-      // Show a confirmation.
-      alert(`Notification: New user '${action.payload.username}' has been registered.`)
+      alert(`User '${action.payload.username}' registered.`)
+      navigateTo('/')
       break
-
-    // We could add more cases here for other actions in the future
-    // case 'USER_DELETED':
-    //   // ... logic to remove a user ...
-    //   break;
-
+    case 'NAVIGATE':
+      navigateTo(action.payload.path)
+      break
     default:
-      console.warn(`SHELL: Received an unknown action type: ${action.type}`)
+      console.warn(`SHELL-A: Unknown action type: ${action.type}`)
   }
 }
 
-// --- The Shell's Context (CTX) ---
-// This remains the same. It's the set of services the Shell offers.
 const shellCTX = reactive({
-  // The 'dispatch' function is now the primary way for spores to send messages.
   dispatch: handleDispatch,
+  state: { users: sharedUsers },
+  utils: { assert, ValidationError },
+})
+// ---------------------------------------------
 
-  // The 'state' object now directly contains our Y.js shared data types.
-  state: {
-    users: sharedUsers,
-  },
+// --- Mycelial-Naver Service State ---
+const activeTrail = ref(null)
+const loadedSporeScripts = new Set()
+const sporeViewStatus = ref('Initializing Naver...')
+const foreignTrails = ref({})
 
-  // Utilities are passed through as before.
-  utils: {
-    assert,
-    ValidationError,
-  },
+const allAvailableTrails = computed(() => {
+  return { ...localTrails, ...foreignTrails.value }
 })
 
-/**
- * This function is called AFTER a spore's script has been loaded.
- * It handles the verification and mounting logic for a single spore.
- */
-const mountSpore = (spore) => {
+// --- The Naver's Core Function (Unchanged) ---
+const navigateTo = async (path) => {
+  console.log(`NAVER: Navigating to trail: ${path}`)
+  const trailConfig = allAvailableTrails.value[path]
+
+  if (!trailConfig) {
+    console.error(`NAVER: No trail found for path: ${path}`)
+    sporeViewStatus.value = `Error: Trail '${path}' not found.`
+    return
+  }
+
   try {
-    spore.status = `Verifying contract...`
+    const view = document.getElementById('spore-view')
+    if (view) view.innerHTML = ''
+    sporeViewStatus.value = `Loading trail: ${path}...`
 
-    // The UMD bundle created a global variable (e.g., window.SporeCurrentUser)
-    const sporeModule = window[spore.globalVar]
-
-    if (!sporeModule) {
-      throw new Error(`Spore did not attach global variable '${spore.globalVar}' to the window.`)
+    if (!loadedSporeScripts.has(trailConfig.name)) {
+      await new Promise((resolve, reject) => {
+        const script = document.createElement('script')
+        script.src = trailConfig.url
+        script.onload = resolve
+        script.onerror = () => reject(new Error(`Failed to load script for ${trailConfig.name}`))
+        document.head.appendChild(script)
+      })
+      loadedSporeScripts.add(trailConfig.name)
     }
-    if (!sporeModule.contract) {
-      throw new Error(`Spore did not expose a 'contract' object.`)
-    }
 
-    // Use our integrated library to verify the contract against our CTX
+    const sporeModule = window[trailConfig.globalVar]
+    if (!sporeModule || !sporeModule.contract)
+      throw new Error('Spore module or contract not found.')
+
     verifyContract(shellCTX, sporeModule.contract)
-    console.log(`SHELL: ✅ Contract for '${spore.name}' is valid.`)
+    console.log(`NAVER: ✅ Contract for ${trailConfig.name} is valid.`)
 
-    spore.status = `Mounting...`
     if (typeof sporeModule.mount === 'function') {
-      const targetElement = document.getElementById(spore.targetId)
-      if (targetElement) {
-        targetElement.innerHTML = '' // Clear placeholder text
-        sporeModule.mount(targetElement, shellCTX)
-        spore.status = 'Loaded' // Final success state
-      } else {
-        throw new Error(`Target element #${spore.targetId} not found.`)
-      }
+      sporeModule.mount(view, shellCTX)
+      activeTrail.value = trailConfig
+      sporeViewStatus.value = ''
     } else {
-      throw new Error(`Spore did not expose a valid mount function.`)
+      throw new Error('Spore does not have a valid mount function.')
     }
   } catch (error) {
-    console.error(`SHELL: ❌ Failed to mount spore '${spore.name}'.`, error)
-    spore.status = `Error: ${error.message}`
+    console.error(`NAVER: Failed to navigate to ${path}.`, error)
+    sporeViewStatus.value = `Error loading trail: ${error.message}`
   }
 }
 
-/**
- * This is the main function that kicks off the entire process.
- * It asks the Rendezvous Server who is available and then loads their scripts.
- */
-const discoverAndLoadSpores = async () => {
-  console.log('SHELL: Discovering available spores from Rendezvous Server...')
+// --- Host Discovery Function (Upgraded with Polling) ---
+let discoveryInterval = null // To hold our setInterval ID
+
+const discoverForeignHosts = async () => {
+  console.log('SHELL-A: Discovering other hosts...')
   try {
-    const response = await fetch('http://localhost:4000/spores')
-    if (!response.ok) {
-      throw new Error('Could not connect to Rendezvous Server.')
+    const response = await fetch('http://localhost:4000/hosts')
+    const hosts = await response.json()
+    const otherHosts = hosts.filter((h) => h.hostName !== 'MycelialShell-A')
+
+    if (otherHosts.length === 0) {
+      console.log('SHELL-A: No other hosts found yet...')
+      return
     }
-    const sporesFromServer = await response.json()
-    console.log(`SHELL: Discovered ${sporesFromServer.length} spore(s).`)
 
-    // Prepare the list for the UI, giving each spore a unique targetId and status
-    discoveredSpores.value = sporesFromServer.map((spore, index) => ({
-      ...spore,
-      targetId: `spore-host-${index}`,
-      status: 'Discovered',
-    }))
-    console.log(`Discovered spores:`, `\n${JSON.stringify(discoveredSpores.value, null, 2)}`)
+    console.log(`SHELL-A: Found ${otherHosts.length} other host(s).`)
 
-    if (discoveredSpores.value.length === 0) return
+    let updated = false
+    for (const host of otherHosts) {
+      // Check if we've already processed this host's spores
+      const trailPathPrefix = `/foreign/${host.hostName}/`
+      const alreadyExists = Object.keys(foreignTrails.value).some((key) =>
+        key.startsWith(trailPathPrefix),
+      )
 
-    // Concurrently load all discovered spore scripts
-    await Promise.all(
-      discoveredSpores.value.map((spore) => {
-        return new Promise((resolve, reject) => {
-          const script = document.createElement('script')
-          script.src = spore.url
-          spore.status = 'Loading script...'
+      if (!alreadyExists) {
+        console.log(`SHELL-A: Fetching manifest from ${host.hostName} at ${host.manifestUrl}`)
+        const manifestResponse = await fetch(host.manifestUrl)
+        const manifest = await manifestResponse.json()
 
-          script.onload = () => {
-            console.log(`SHELL: Script for ${spore.name} loaded.`)
-            // Once the script is loaded, resolve the promise so mounting can begin
-            resolve()
+        for (const spore of manifest.spores) {
+          const trailPath = `${trailPathPrefix}${spore.name}`
+          foreignTrails.value[trailPath] = {
+            ...spore,
+            displayName: `${spore.name} (from ${host.hostName})`,
           }
-          script.onerror = () => {
-            spore.status = `Error: Failed to load script from ${spore.url}`
-            // Reject so Promise.all knows a script failed
-            reject(new Error(spore.status))
-          }
-          document.head.appendChild(script)
-        })
-      }),
-    )
-
-    // After all scripts have successfully loaded, mount them
-    console.log('SHELL: All spore scripts loaded. Now mounting...')
-    for (const spore of discoveredSpores.value) {
-      mountSpore(spore)
+          console.log(`SHELL-A: Created new trail: ${trailPath}`)
+          updated = true
+        }
+      }
+    }
+    if (updated) {
+      console.log('SHELL-A: Foreign trails have been updated.', foreignTrails.value)
     }
   } catch (error) {
-    console.error('SHELL: ❌ Spore discovery failed.', error)
-    // You could set a global error status here if needed
+    console.error('SHELL-A: Failed to discover foreign hosts.', error)
   }
 }
 
-watch(
-  () => shellCTX.state.currentUser,
-  (newValue) => {
-    console.log(`CurrentUser changed to:`, `\n${JSON.stringify(newValue, null, 2)}`)
-  },
-  { deep: true },
-)
+onMounted(async () => {
+  // 1. Immediately navigate to our local default trail
+  navigateTo('/')
 
-onMounted(() => {
-  // When the shell mounts, kick off the discovery process.
-  discoverAndLoadSpores()
-  console.info(`Shell CTX:`, `\n${JSON.stringify(shellCTX, null, 2)}`)
+  // 2. Do an initial discovery check
+  await discoverForeignHosts()
+
+  // 3. Start polling for new hosts every 5 seconds
+  discoveryInterval = setInterval(discoverForeignHosts, 5000)
+})
+
+onUnmounted(() => {
+  // Clean up the interval when the component is destroyed
+  if (discoveryInterval) {
+    clearInterval(discoveryInterval)
+  }
 })
 </script>
 
 <template>
   <div class="shell-container">
     <header class="shell-header">
-      <h1 class="shell-title">MycelialShell</h1>
-      <p class="shell-status">Status: Running</p>
+      <h1 class="shell-title">MycelialShell-A</h1>
+      <p class="shell-status">Naver Active Trail: {{ activeTrail ? activeTrail.name : 'None' }}</p>
     </header>
 
-    <main class="spore-grid">
-      <!-- We use v-for to dynamically create a host for each discovered spore -->
-      <div
-        v-for="spore in discoveredSpores"
-        :key="spore.name"
-        :id="spore.targetId"
-        class="spore-host"
-      >
-        <!-- The Spore's content will replace this status text if loading is successful -->
-        <p class="spore-description" v-if="spore.status !== 'Loaded'">{{ spore.status }}</p>
-      </div>
+    <div class="app-body">
+      <!-- Navigation Sidebar -->
+      <nav class="sidebar">
+        <h2 class="sidebar-title">Available Trails</h2>
+        <ul>
+          <li v-for="(trail, path) in allAvailableTrails" :key="path">
+            <a href="#" @click.prevent="navigateTo(path)">
+              {{ trail.displayName || trail.name }}
+            </a>
+          </li>
+        </ul>
+      </nav>
 
-      <div v-if="!discoveredSpores.length" class="spore-host">
-        <p class="spore-description">
-          No spores have registered. Please start a spore's preview server.
-        </p>
-      </div>
-    </main>
-
-    <footer class="shell-footer">
-      <p>Mycelial Shell Context (CTX) is initialized and ready.</p>
-    </footer>
+      <main class="main-view">
+        <!-- The single view area where spores are mounted -->
+        <div id="spore-view" class="spore-view-host">
+          <p v-if="sporeViewStatus" class="spore-description">{{ sporeViewStatus }}</p>
+        </div>
+      </main>
+    </div>
   </div>
 </template>
 
@@ -209,62 +196,74 @@ onMounted(() => {
 .shell-container {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
-  font-family:
-    Inter,
-    -apple-system,
-    BlinkMacSystemFont,
-    'Segoe UI',
-    Roboto,
-    Oxygen,
-    Ubuntu,
-    Cantarell,
-    'Fira Sans',
-    'Droid Sans',
-    'Helvetica Neue',
-    sans-serif;
+  height: 100vh;
+  font-family: Inter, sans-serif;
   background-color: #1a1a1a;
   color: #f0f0f0;
 }
 .shell-header {
-  padding: 1.5rem 2rem;
+  padding: 1rem 2rem;
   border-bottom: 1px solid #333;
   text-align: center;
+  flex-shrink: 0;
 }
 .shell-title {
-  font-size: 2rem;
+  font-size: 1.5rem;
   font-weight: 700;
   color: #a78bfa;
 }
 .shell-status {
+  font-size: 0.8rem;
   color: #888;
 }
-.spore-grid {
-  flex-grow: 1;
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-  gap: 2rem;
-  padding: 2rem;
-}
-.spore-host {
-  border: 2px dashed #444;
-  border-radius: 8px;
-  padding: 1.5rem;
-  background-color: #242424;
-  min-height: 400px;
+.app-body {
   display: flex;
-  flex-direction: column;
-  justify-content: center;
+  flex-grow: 1;
+  overflow: hidden;
+}
+.sidebar {
+  width: 250px;
+  background-color: #242424;
+  border-right: 1px solid #333;
+  padding: 1.5rem;
+  flex-shrink: 0;
+  overflow-y: auto;
+}
+.sidebar-title {
+  font-size: 1.2rem;
+  font-weight: 600;
+  margin-bottom: 1.5rem;
+}
+.sidebar ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.sidebar li a {
+  display: block;
+  padding: 0.75rem 1rem;
+  color: #d1d5db;
+  text-decoration: none;
+  border-radius: 0.5rem;
+  transition: background-color 0.2s;
+  word-break: break-word;
+}
+.sidebar li a:hover {
+  background-color: #374151;
+}
+.main-view {
+  flex-grow: 1;
+  padding: 2rem;
+  overflow-y: auto;
+}
+.spore-view-host {
+  width: 100%;
+  max-width: 1000px;
+  margin: 0 auto;
 }
 .spore-description {
   color: #999;
   text-align: center;
-}
-.shell-footer {
-  padding: 1rem 2rem;
-  border-top: 1px solid #333;
-  text-align: center;
-  font-size: 0.8rem;
-  color: #666;
+  padding-top: 2rem;
 }
 </style>
