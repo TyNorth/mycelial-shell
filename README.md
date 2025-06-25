@@ -6,6 +6,9 @@ This project is a complete, working proof-of-concept for the Mycelial framework,
 
 The core philosophy is to move beyond monolithic applications by composing a user experience from independent, dynamically discovered "Spores" (micro-apps) that run within a host "Shell." The Shell provides a shared set of services and a real-time state layer, allowing Spores to communicate and react to each other without being directly coupled.
 
+![Screenshot 2025-06-19 105002](https://github.com/user-attachments/assets/7f70c971-fcb7-408f-ba38-92e6674db571)
+
+
 ## **Core Concepts**
 
 * **Shell:** A host application that provides a runtime environment. It is responsible for discovering Spores, verifying their contracts, and mounting them. It presents available Spores in a dashboard-style grid layout, providing a user-friendly launcher for the federated applications.  
